@@ -22,7 +22,7 @@ Support for cancellation has been added to all core library infrastructure types
 Cancellation support is in progress for all collection infrastructure types:
 - ECS Tasks (https://github.com/PrefectHQ/prefect-aws/pull/163)
 - Azure Container Instances (...)
-- Google Cloud Run Jobs (...)
+- Google Cloud Run Jobs (https://github.com/PrefectHQ/prefect-gcp/pull/76)
 
 At this time, this feature requires the flow run to be submitted by an agent — flow runs without deployments cannot be cancelled yet. We're working on adding another cancellation mechanism that does not require the agent, but it will not provide as strong of a guarantee that your infrastructure shutsdown.
 
@@ -44,16 +44,60 @@ See https://github.com/PrefectHQ/prefect/pull/7637 for more details.
 
 ### Logging of prints in flows and tasks
 
-...
+Flows or tasks can now opt-in to logging print statements. This is much like the `log_stdout` feature in Prefect 1, but we've improved the _scoping_ so you can enable or disable the feature at the flow or task level.
 
-See https://github.com/PrefectHQ/prefect/pull/7580 for more details.
+In the following example, the print statements will be redirected to the logger for the flow run and task run accordingly:
+
+```python
+from prefect import task, flow
+
+@task
+def my_task():
+    print("world")
+
+@flow(log_prints=True)
+def my_flow():
+    print("hello")
+    my_task()
+```
+
+The output from these prints will appear in the UI!
+
+This feature will also capture prints made in functions called by tasks or flows — as long as you're within the context of the run the prints will be logged.
+
+If you have a sensitive task, it can opt-out even if the flow has enabled logging of prints:
+
+```python
+@task(log_prints=False)
+def my_secret_task():
+    print(":)")
+```
+
+This print statement will appear locally as normal, but won't be sent to the Prefect logger or API.
+
+See [the logging documentation](https://docs.prefect.io/concepts/logs/#logging-print-statements) for more details.
+
+See https://github.com/PrefectHQ/prefect/pull/7580 for implementation details.
 
 
 ### Agent flow run concurrency limits
 
-...
+Agents can now limit the number of concurrent flow runs they are managing.
 
-See https://github.com/PrefectHQ/prefect/pull/7361 for more details
+For example, start an agent with:
+
+```
+prefect agent start -q default --limit 10
+```
+
+When the agent submits a flow run, it will track it in a local concurrency slot. If the agent is managing more than 10 flow runs, the agent will not accept any more work from its work queues. When the infrastructure for a flow run exits, the agent will release a concurrency slot and another flow run can be submitted.
+
+This feature is especially useful for limiting resource consumption when running flows locally! It also provides a way to roughly balance load across multiple agents.
+
+Thanks to @eudyptula for contributing!
+
+See https://github.com/PrefectHQ/prefect/pull/7361 for more details.
+
 
 ### Enhancements
 - Update login to prompt for "API key" instead of "authentication key" — https://github.com/PrefectHQ/prefect/pull/7649
@@ -66,6 +110,8 @@ See https://github.com/PrefectHQ/prefect/pull/7361 for more details
 - Add agent reporting of crashed flow run infrastructure — https://github.com/PrefectHQ/prefect/pull/7670
 - Raise `CancelledRun` when retrieving a `Cancelled` state's result — https://github.com/PrefectHQ/prefect/pull/7699
 - Use new database session to send each flow run notification — https://github.com/PrefectHQ/prefect/pull/7644
+- Increase default agent query interval to 10s — https://github.com/PrefectHQ/prefect/pull/7703
+- Add default messages to state exceptions — https://github.com/PrefectHQ/prefect/pull/7705
 
 ### Fixes
 - Prompt workspace selection if API key is set but API URL is not set — https://github.com/PrefectHQ/prefect/pull/7648
@@ -74,6 +120,7 @@ See https://github.com/PrefectHQ/prefect/pull/7361 for more details
 - Fix bug where result event is missing when wait is called before submission completes — https://github.com/PrefectHQ/prefect/pull/7571
 - Fix support for sync-compatible calls in `deployment build` — https://github.com/PrefectHQ/prefect/pull/7417
 - Fix bug in `StateGroup` that caused `all_final` to be wrong — https://github.com/PrefectHQ/prefect/pull/7678
+- Add retry on specified httpx network errors — https://github.com/PrefectHQ/prefect/pull/7593
 
 ### Documentation
 - Fix heading links in docs — https://github.com/PrefectHQ/prefect/pull/7665
