@@ -15,10 +15,12 @@ Engine process overview
 - The run is orchestrated through states, calling the user's function as necessary.
     See `orchestrate_flow_run`, `orchestrate_task_run`
 """
+import asyncio
 import logging
 import os
 import signal
 import sys
+import time
 from contextlib import AsyncExitStack, asynccontextmanager, nullcontext
 from functools import partial
 from typing import Any, Awaitable, Dict, Iterable, List, Optional, Set, TypeVar, Union
@@ -34,6 +36,7 @@ import prefect.context
 from prefect._internal.concurrency.api import create_call, from_async, from_sync
 from prefect._internal.concurrency.calls import get_current_call
 from prefect._internal.concurrency.threads import wait_for_global_loop_exit
+from prefect._internal.concurrency.timeouts import get_deadline
 from prefect.client.orchestration import PrefectClient, get_client
 from prefect.client.schemas import FlowRun, OrchestrationResult, TaskRun
 from prefect.client.utilities import inject_client
@@ -44,7 +47,6 @@ from prefect.context import (
     TaskRunContext,
 )
 from prefect.deployments import load_flow_from_flow_run
-from prefect.events.worker import async_get_events_worker
 from prefect.exceptions import (
     Abort,
     FlowPauseTimeout,
@@ -98,7 +100,6 @@ from prefect.utilities.annotations import allow_failure, quote, unmapped
 from prefect.utilities.asyncutils import (
     gather,
     is_async_fn,
-    run_async_from_worker_thread,
     run_sync_in_worker_thread,
     sync_compatible,
 )
@@ -115,6 +116,7 @@ R = TypeVar("R")
 EngineReturnType = Literal["future", "state", "result"]
 
 
+API_HEALTHCHECKS = {}
 UNTRACKABLE_TYPES = {bool, type(None), type(...), type(NotImplemented)}
 engine_logger = get_logger("engine")
 
@@ -199,7 +201,7 @@ def enter_flow_run_engine_from_subprocess(flow_run_id: UUID) -> State:
 
     return from_sync.wait_for_call_in_loop_thread(
         create_call(retrieve_flow_then_begin_flow_run, flow_run_id)
-    ).result()
+    )
 
 
 @inject_client
@@ -218,11 +220,8 @@ async def create_then_begin_flow_run(
     # TODO: Returns a `State` depending on `return_type` and we can add an overload to
     #       the function signature to clarify this eventually.
 
-    connect_error = await client.api_healthcheck()
-    if connect_error:
-        raise RuntimeError(
-            f"Cannot create flow run. Failed to reach API at {client.api_url}."
-        ) from connect_error
+    await check_api_reachable(client, "Cannot create flow run")
+
     state = Pending()
     if flow.should_validate_parameters:
         try:
@@ -383,10 +382,6 @@ async def begin_flow_run(
             flow, client=client
         )
 
-        flow_run_context.events = await stack.enter_async_context(
-            async_get_events_worker()
-        )
-
         if log_prints:
             stack.enter_context(patch_print())
 
@@ -410,7 +405,7 @@ async def begin_flow_run(
                 f" {timeout.to_rfc3339_string()} to finish execution."
             ),
         )
-        APILogHandler.flush(block=True)
+        await APILogHandler.flush()
 
         return terminal_or_paused_state
     else:
@@ -426,7 +421,7 @@ async def begin_flow_run(
 
     # When a "root" flow run finishes, flush logs so we do not have to rely on handling
     # during interpreter shutdown
-    APILogHandler.flush(block=True)
+    await APILogHandler.flush()
 
     return terminal_state
 
@@ -636,6 +631,7 @@ async def orchestrate_flow_run(
                 flow=flow,
                 flow_run=flow_run,
                 client=client,
+                parameters=parameters,
             ) as flow_run_context:
                 args, kwargs = parameters_to_args_kwargs(flow.fn, parameters)
                 logger.debug(
@@ -1003,7 +999,7 @@ async def begin_task_map(
     static_parameters = {}
     annotated_parameters = {}
     for key, val in parameters.items():
-        if isinstance(val, allow_failure):
+        if isinstance(val, (allow_failure, quote)):
             # Unwrap annotated parameters to determine if they are iterable
             annotated_parameters[key] = val
             val = val.unwrap()
@@ -1038,6 +1034,11 @@ async def begin_task_map(
         call_parameters = {key: value[i] for key, value in iterable_parameters.items()}
         call_parameters.update({key: value for key, value in static_parameters.items()})
 
+        # Add default values for parameters; these are skipped earlier since they should
+        # not be mapped over
+        for key, value in get_parameter_defaults(task.fn).items():
+            call_parameters.setdefault(key, value)
+
         # Re-apply annotations to each key again
         for key, annotation in annotated_parameters.items():
             call_parameters[key] = annotation.rewrap(call_parameters[key])
@@ -1058,6 +1059,11 @@ async def begin_task_map(
             )
         )
 
+    # Maintain the order of the task runs when using the sequential task runner
+    runner = task_runner if task_runner else flow_run_context.task_runner
+    if runner.concurrency_type == TaskConcurrencyType.SEQUENTIAL:
+        return [await task_run() for task_run in task_runs]
+
     return await gather(*task_runs)
 
 
@@ -1075,11 +1081,13 @@ async def collect_task_run_inputs(expr: Any, max_depth: int = -1) -> Set[TaskRun
     # TODO: This function needs to be updated to detect parameters and constants
 
     inputs = set()
+    futures = set()
 
     def add_futures_and_states_to_inputs(obj):
         if isinstance(obj, PrefectFuture):
-            run_async_from_worker_thread(obj._wait_for_submission)
-            inputs.add(TaskRunResult(id=obj.task_run.id))
+            # We need to wait for futures to be submitted before we can get the task
+            # run id but we want to do so asynchronously
+            futures.add(obj)
         elif isinstance(obj, State):
             if obj.state_details.task_run_id:
                 inputs.add(TaskRunResult(id=obj.state_details.task_run_id))
@@ -1088,13 +1096,16 @@ async def collect_task_run_inputs(expr: Any, max_depth: int = -1) -> Set[TaskRun
             if state and state.state_details.task_run_id:
                 inputs.add(TaskRunResult(id=state.state_details.task_run_id))
 
-    await run_sync_in_worker_thread(
-        visit_collection,
+    visit_collection(
         expr,
         visit_fn=add_futures_and_states_to_inputs,
         return_data=False,
         max_depth=max_depth,
     )
+
+    await asyncio.gather(*[future._wait_for_submission() for future in futures])
+    for future in futures:
+        inputs.add(TaskRunResult(id=future.task_run.id))
 
     return inputs
 
@@ -1352,13 +1363,9 @@ async def begin_task_run(
         if log_prints:
             stack.enter_context(patch_print())
 
-        connect_error = await client.api_healthcheck()
-        if connect_error:
-            raise RuntimeError(
-                f"Cannot orchestrate task run '{task_run.id}'. "
-                f"Failed to connect to API at {client.api_url}."
-            ) from connect_error
-
+        await check_api_reachable(
+            client, f"Cannot orchestrate task run '{task_run.id}'"
+        )
         try:
             state = await orchestrate_task_run(
                 task=task,
@@ -1374,7 +1381,7 @@ async def begin_task_run(
             if not maybe_flow_run_context:
                 # When a a task run finishes on a remote worker flush logs to prevent
                 # loss if the process exits
-                APILogHandler.flush(block=True)
+                await APILogHandler.flush()
 
         except Abort as abort:
             # Task run probably already completed, fetch its state
@@ -1437,7 +1444,8 @@ async def orchestrate_task_run(
     Returns:
         The final state of the run
     """
-    logger = task_run_logger(task_run, task=task)
+    flow_run = await client.read_flow_run(task_run.flow_run_id)
+    logger = task_run_logger(task_run, task=task, flow_run=flow_run)
 
     partial_task_run_context = PartialModel(
         TaskRunContext,
@@ -1466,10 +1474,15 @@ async def orchestrate_task_run(
     # Generate the cache key to attach to proposed states
     # The cache key uses a TaskRunContext that does not include a `timeout_context``
     cache_key = (
-        task.cache_key_fn(partial_task_run_context.finalize(), resolved_parameters)
+        task.cache_key_fn(
+            partial_task_run_context.finalize(parameters=resolved_parameters),
+            resolved_parameters,
+        )
         if task.cache_key_fn
         else None
     )
+
+    task_run_context = partial_task_run_context.finalize(parameters=resolved_parameters)
 
     # Ignore the cached results for a cache key, default = false
     # Setting on task level overrules the Prefect setting (env var)
@@ -1504,105 +1517,107 @@ async def orchestrate_task_run(
         # Retrieve the latest metadata for the task run context
         task_run = await client.read_task_run(task_run.id)
 
-        try:
-            with timeout_context as timeout_scope:
-                task_run_context = partial_task_run_context.finalize(
-                    timeout_scope=timeout_scope
-                )
-                args, kwargs = parameters_to_args_kwargs(task.fn, resolved_parameters)
-
-                # update task run name
-                if not run_name_set and task.task_run_name:
-                    task_run_name = task.task_run_name.format(**resolved_parameters)
-                    await client.set_task_run_name(
-                        task_run_id=task_run.id, name=task_run_name
-                    )
-                    logger.extra["task_run_name"] = task_run_name
-                    logger.debug(
-                        f"Renamed task run {task_run.name!r} to {task_run_name!r}"
-                    )
-                    task_run.name = task_run_name
-                    run_name_set = True
-
-                if PREFECT_DEBUG_MODE.value():
-                    logger.debug(f"Executing {call_repr(task.fn, *args, **kwargs)}")
-                else:
-                    logger.debug(
-                        f"Beginning execution...", extra={"state_message": True}
+        with task_run_context.copy(
+            update={"task_run": task_run, "start_time": pendulum.now("UTC")}
+        ):
+            try:
+                with timeout_context as timeout_scope:
+                    args, kwargs = parameters_to_args_kwargs(
+                        task.fn, resolved_parameters
                     )
 
-                with task_run_context.copy(
-                    update={"task_run": task_run, "start_time": pendulum.now("UTC")}
+                    # update task run name
+                    if not run_name_set and task.task_run_name:
+                        task_run_name = task.task_run_name.format(**resolved_parameters)
+                        await client.set_task_run_name(
+                            task_run_id=task_run.id, name=task_run_name
+                        )
+                        logger.extra["task_run_name"] = task_run_name
+                        logger.debug(
+                            f"Renamed task run {task_run.name!r} to {task_run_name!r}"
+                        )
+                        task_run.name = task_run_name
+                        run_name_set = True
+
+                    if PREFECT_DEBUG_MODE.value():
+                        logger.debug(f"Executing {call_repr(task.fn, *args, **kwargs)}")
+                    else:
+                        logger.debug(
+                            f"Beginning execution...", extra={"state_message": True}
+                        )
+
+                        call = from_async.call_soon_in_new_thread(
+                            create_call(task.fn, *args, **kwargs)
+                        )
+                        result = await call.aresult()
+
+            except Exception as exc:
+                name = message = None
+                if (
+                    # Task run timeouts
+                    isinstance(exc, TimeoutError)
+                    and timeout_scope
+                    # Only update the message if the timeout was actually encountered since
+                    # this could be a timeout in the user's code
+                    and timeout_scope.cancel_called
                 ):
-                    call = from_async.call_soon_in_new_thread(
-                        create_call(task.fn, *args, **kwargs)
+                    name = "TimedOut"
+                    message = (
+                        f"Task run exceeded timeout of {task.timeout_seconds} seconds"
                     )
-                    result = await call.aresult()
+                    logger.exception(message)
+                else:
+                    message = "Task run encountered an exception:"
+                    logger.exception("Encountered exception during execution:")
 
-        except Exception as exc:
-            name = message = None
-            if (
-                # Task run timeouts
-                isinstance(exc, TimeoutError)
-                and timeout_scope
-                # Only update the message if the timeout was actually encountered since
-                # this could be a timeout in the user's code
-                and timeout_scope.cancel_called
-            ):
-                name = "TimedOut"
-                message = f"Task run exceeded timeout of {task.timeout_seconds} seconds"
-                logger.exception(message)
-            else:
-                message = "Task run encountered an exception:"
-                logger.exception("Encountered exception during execution:")
-
-            terminal_state = await exception_to_failed_state(
-                name=name,
-                message=message,
-                result_factory=task_run_context.result_factory,
-            )
-        else:
-            terminal_state = await return_value_to_state(
-                result,
-                result_factory=task_run_context.result_factory,
-            )
-
-            # for COMPLETED tasks, add the cache key and expiration
-            if terminal_state.is_completed():
-                terminal_state.state_details.cache_expiration = (
-                    (pendulum.now("utc") + task.cache_expiration)
-                    if task.cache_expiration
-                    else None
+                terminal_state = await exception_to_failed_state(
+                    name=name,
+                    message=message,
+                    result_factory=task_run_context.result_factory,
                 )
-                terminal_state.state_details.cache_key = cache_key
+            else:
+                terminal_state = await return_value_to_state(
+                    result,
+                    result_factory=task_run_context.result_factory,
+                )
 
-        state = await propose_state(client, terminal_state, task_run_id=task_run.id)
+                # for COMPLETED tasks, add the cache key and expiration
+                if terminal_state.is_completed():
+                    terminal_state.state_details.cache_expiration = (
+                        (pendulum.now("utc") + task.cache_expiration)
+                        if task.cache_expiration
+                        else None
+                    )
+                    terminal_state.state_details.cache_key = cache_key
 
-        await _run_task_hooks(
-            task=task,
-            task_run=task_run,
-            state=state,
-        )
+            state = await propose_state(client, terminal_state, task_run_id=task_run.id)
 
-        if state.type != terminal_state.type and PREFECT_DEBUG_MODE:
-            logger.debug(
-                (
-                    f"Received new state {state} when proposing final state"
-                    f" {terminal_state}"
-                ),
-                extra={"send_to_orion": False},
+            await _run_task_hooks(
+                task=task,
+                task_run=task_run,
+                state=state,
             )
 
-        if not state.is_final():
-            logger.info(
-                (
-                    f"Received non-final state {state.name!r} when proposing final"
-                    f" state {terminal_state.name!r} and will attempt to run again..."
-                ),
-                extra={"send_to_orion": False},
-            )
-            # Attempt to enter a running state again
-            state = await propose_state(client, Running(), task_run_id=task_run.id)
+            if state.type != terminal_state.type and PREFECT_DEBUG_MODE:
+                logger.debug(
+                    (
+                        f"Received new state {state} when proposing final state"
+                        f" {terminal_state}"
+                    ),
+                    extra={"send_to_orion": False},
+                )
+
+            if not state.is_final():
+                logger.info(
+                    (
+                        f"Received non-final state {state.name!r} when proposing final"
+                        f" state {terminal_state.name!r} and will attempt to run"
+                        " again..."
+                    ),
+                    extra={"send_to_orion": False},
+                )
+                # Attempt to enter a running state again
+                state = await propose_state(client, Running(), task_run_id=task_run.id)
 
     # If debugging, use the more complete `repr` than the usual `str` description
     display_state = repr(state) if PREFECT_DEBUG_MODE else str(state)
@@ -1763,6 +1778,47 @@ async def resolve_inputs(
         UpstreamTaskError: If any of the upstream states are not `COMPLETED`
     """
 
+    futures = set()
+    states = set()
+    result_by_state = {}
+
+    def collect_futures_and_states(expr, context):
+        # Expressions inside quotes should not be traversed
+        if isinstance(context.get("annotation"), quote):
+            raise StopVisiting()
+
+        if isinstance(expr, PrefectFuture):
+            futures.add(expr)
+        if isinstance(expr, State):
+            states.add(expr)
+
+        return expr
+
+    visit_collection(
+        parameters,
+        visit_fn=collect_futures_and_states,
+        return_data=False,
+        max_depth=max_depth,
+        context={},
+    )
+
+    # Wait for all futures so we do not block when we retrieve the state in `resolve_input`
+    states.update(await asyncio.gather(*[future._wait() for future in futures]))
+
+    # Only retrieve the result if requested as it may be expensive
+    if return_data:
+        finished_states = [state for state in states if state.is_final()]
+
+        state_results = await asyncio.gather(
+            *[
+                state.result(raise_on_failure=False, fetch=True)
+                for state in finished_states
+            ]
+        )
+
+        for state, result in zip(finished_states, state_results):
+            result_by_state[state] = result
+
     def resolve_input(expr, context):
         state = None
 
@@ -1771,7 +1827,7 @@ async def resolve_inputs(
             raise StopVisiting()
 
         if isinstance(expr, PrefectFuture):
-            state = run_async_from_worker_thread(expr._wait)
+            state = expr._final_state
         elif isinstance(expr, State):
             state = expr
         else:
@@ -1793,11 +1849,9 @@ async def resolve_inputs(
                 " 'COMPLETED' state."
             )
 
-        # Only retrieve the result if requested as it may be expensive
-        return state.result(raise_on_failure=False, fetch=True) if return_data else None
+        return result_by_state.get(state)
 
-    return await run_sync_in_worker_thread(
-        visit_collection,
+    return visit_collection(
         parameters,
         visit_fn=resolve_input,
         return_data=return_data,
@@ -2067,6 +2121,24 @@ async def _run_flow_hooks(flow: Flow, flow_run: FlowRun, state: State) -> None:
                 )
             else:
                 logger.info(f"Hook {hook.__name__!r} finished running successfully")
+
+
+async def check_api_reachable(client: PrefectClient, fail_message: str):
+    # Do not perform a healthcheck if it exists and is not expired
+    api_url = str(client.api_url)
+    if api_url in API_HEALTHCHECKS:
+        expires = API_HEALTHCHECKS[api_url]
+        if expires > time.monotonic():
+            return
+
+    connect_error = await client.api_healthcheck()
+    if connect_error:
+        raise RuntimeError(
+            f"{fail_message}. Failed to reach API at {api_url}."
+        ) from connect_error
+
+    # Create a 10 minute cache for the healthy response
+    API_HEALTHCHECKS[api_url] = get_deadline(60 * 10)
 
 
 if __name__ == "__main__":
