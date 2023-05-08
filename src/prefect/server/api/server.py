@@ -12,10 +12,12 @@ from typing import Awaitable, Callable, Dict, List, Mapping, Optional, Tuple
 
 import anyio
 import sqlalchemy as sa
+import sqlalchemy.exc
 from fastapi import APIRouter, Depends, FastAPI, Request, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -75,6 +77,7 @@ API_ROUTERS = (
     api.block_schemas.router,
     api.block_capabilities.router,
     api.collections.router,
+    api.variables.router,
     api.ui.flow_runs.router,
     api.admin.router,
     api.root.router,
@@ -130,7 +133,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
 async def integrity_exception_handler(request: Request, exc: Exception):
     """Capture database integrity errors."""
-    logger.error(f"Encountered exception in request:", exc_info=True)
+    logger.error("Encountered exception in request:", exc_info=True)
     return JSONResponse(
         content={
             "detail": (
@@ -143,9 +146,32 @@ async def integrity_exception_handler(request: Request, exc: Exception):
     )
 
 
+async def db_locked_exception_handler(
+    request: Request, exc: sqlalchemy.exc.OperationalError
+):
+    """
+    Catch all sqlalchemy.exc.OperationalError. Return a 503 if it's a db locked error
+    to retry, otherwise log the error and return 500.
+    """
+    if (
+        getattr(exc.orig, "sqlite_errorname", None) == "SQLITE_BUSY"
+        and getattr(exc.orig, "sqlite_errorcode", None) == 5
+    ):
+        return JSONResponse(
+            content={"exception_message": "Service Unavailable"},
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+
+    logger.error("Encountered exception in request:", exc_info=True)
+    return JSONResponse(
+        content={"exception_message": "Internal Server Error"},
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+    )
+
+
 async def custom_internal_exception_handler(request: Request, exc: Exception):
     """Log a detailed exception for internal server errors before returning."""
-    logger.error(f"Encountered exception in request:", exc_info=True)
+    logger.error("Encountered exception in request:", exc_info=True)
     return JSONResponse(
         content={"exception_message": "Internal Server Error"},
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -186,6 +212,7 @@ def create_orion_api(
     """
     fast_api_app_kwargs = fast_api_app_kwargs or {}
     api_app = FastAPI(title=API_TITLE, **fast_api_app_kwargs)
+    api_app.add_middleware(GZipMiddleware)
 
     @api_app.get(health_check_path, tags=["Root"])
     async def health_check():
@@ -245,6 +272,7 @@ def create_orion_api(
 
 def create_ui_app(ephemeral: bool) -> FastAPI:
     ui_app = FastAPI(title=UI_TITLE)
+    ui_app.add_middleware(GZipMiddleware)
 
     if os.name == "nt":
         # Windows defaults to text/plain for .js files
@@ -443,7 +471,7 @@ def create_app(
                 await asyncio.gather(
                     *[task.stop() for task in app.state.services.values()]
                 )
-            except Exception as exc:
+            except Exception:
                 # `on_service_exit` should handle logging exceptions on exit
                 pass
 
@@ -502,6 +530,9 @@ def create_app(
         == "sqlite"
     ):
         app.add_middleware(RequestLimitMiddleware, limit=100)
+        api_app.add_exception_handler(
+            sqlalchemy.exc.OperationalError, db_locked_exception_handler
+        )
 
     api_app.mount(
         "/static",

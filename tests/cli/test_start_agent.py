@@ -11,7 +11,7 @@ from prefect.utilities.processutils import open_process
 
 POLL_INTERVAL = 0.5
 STARTUP_TIMEOUT = 20
-SHUTDOWN_TIMEOUT = 40
+SHUTDOWN_TIMEOUT = 60
 
 
 @pytest.fixture(scope="function")
@@ -40,11 +40,11 @@ async def agent_process():
 
         for _ in range(int(STARTUP_TIMEOUT / POLL_INTERVAL)):
             await anyio.sleep(POLL_INTERVAL)
-            if out.tell() > 200:
-                await anyio.sleep(0.5)
+            if out.tell() > 400:
+                await anyio.sleep(2)
                 break
 
-        assert out.tell() > 200, "The agent did not start up in time"
+        assert out.tell() > 400, "The agent did not start up in time"
         assert process.returncode is None, "The agent failed to start up"
 
         # Yield to the consuming tests

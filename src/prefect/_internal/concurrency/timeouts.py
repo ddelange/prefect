@@ -135,6 +135,18 @@ def get_deadline(timeout: Optional[float]):
     return time.monotonic() + timeout
 
 
+def get_timeout(deadline: Optional[float]):
+    """
+    Compute an timeout given a deadline.
+
+    Uses a monotonic clock.
+    """
+    if deadline is None:
+        return None
+
+    return max(0, deadline - time.monotonic())
+
+
 class _AsyncCanceller(anyio._backends._asyncio.CancelScope):
     """
     Implementation for cancellation of async tasks.
@@ -237,10 +249,7 @@ def cancel_sync_after(timeout: Optional[float]):
         # Timeouts cannot be enforced on Windows
         if timeout is not None:
             logger.warning(
-                (
-                    f"Entered cancel context on Windows; %.2f timeout will not be"
-                    f" enforced."
-                ),
+                "Entered cancel context on Windows; %.2f timeout will not be enforced.",
                 timeout,
             )
         yield CancelContext(timeout=None, cancel=lambda: None)
@@ -255,7 +264,7 @@ def cancel_sync_after(timeout: Optional[float]):
 
     with method(timeout) as ctx:
         logger.debug(
-            f"Entered synchronous %s based cancel context %r",
+            "Entered synchronous %s based cancel context %r",
             method_name,
             ctx,
         )
@@ -276,7 +285,7 @@ def _alarm_based_timeout(timeout: Optional[float]):
     raised in the main thread and this cannot be used elsewhere.
     """
     current_thread = threading.current_thread()
-    if not current_thread is threading.main_thread():
+    if current_thread is not threading.main_thread():
         raise ValueError("Alarm based timeouts can only be used in the main thread.")
 
     # Create a context that raises an alarm signal on cancellation
@@ -338,7 +347,9 @@ def _watcher_thread_based_timeout(timeout: Optional[float]):
         if supervised_thread.is_alive():
             _send_exception_to_thread(supervised_thread, exc)
 
-    cancel = lambda: _send_exception(CancelledError)
+    def cancel():
+        return _send_exception(CancelledError)
+
     ctx = CancelContext(timeout=timeout, cancel=cancel)
 
     def timeout_enforcer():

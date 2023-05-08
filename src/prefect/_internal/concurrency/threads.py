@@ -4,12 +4,14 @@ Utilities for managing worker threads.
 import asyncio
 import atexit
 import concurrent.futures
+import itertools
 import queue
 import threading
-from typing import Optional
+from typing import List, Optional
 
 from prefect._internal.concurrency.calls import Call, Portal
 from prefect._internal.concurrency.primitives import Event
+from prefect._internal.concurrency.event_loop import get_running_loop
 from prefect.logging import get_logger
 
 logger = get_logger("prefect._internal.concurrency.threads")
@@ -20,9 +22,14 @@ class WorkerThread(Portal):
     A portal to a worker running on a thread.
     """
 
+    # Used for unique thread names by default
+    _counter = itertools.count().__next__
+
     def __init__(
-        self, name: str = "WorkerThread", daemon: bool = False, run_once: bool = False
+        self, name: Optional[str] = None, daemon: bool = False, run_once: bool = False
     ):
+        name = name or f"WorkerThread-{self._counter()}"
+
         self.thread = threading.Thread(
             name=name, daemon=daemon, target=self._entrypoint
         )
@@ -125,6 +132,8 @@ class EventLoopThread(Portal):
         self._shutdown_event: Event = Event()
         self._run_once: bool = run_once
         self._submitted_count: int = 0
+        self._on_shutdown: List[Call] = []
+        self._lock = threading.Lock()
 
         if not daemon:
             atexit.register(self.shutdown)
@@ -133,31 +142,34 @@ class EventLoopThread(Portal):
         """
         Start the worker thread; raises any exceptions encountered during startup.
         """
-        self.thread.start()
-        # Wait for the worker to be ready
-        self._ready_future.result()
+        with self._lock:
+            if self._loop is None:
+                self.thread.start()
+                self._ready_future.result()
 
     def submit(self, call: Call) -> Call:
-        if self._submitted_count > 0 and self._run_once:
-            raise RuntimeError(
-                "Worker configured to only run once. A call has already been submitted."
-            )
-
         if self._loop is None:
             self.start()
 
-        if self._shutdown_event.is_set():
-            raise RuntimeError("Worker is shutdown.")
+        with self._lock:
+            if self._submitted_count > 0 and self._run_once:
+                raise RuntimeError(
+                    "Worker configured to only run once. A call has already been"
+                    " submitted."
+                )
 
-        # Track the portal running the call
-        call.set_runner(self)
+            if self._shutdown_event.is_set():
+                raise RuntimeError("Worker is shutdown.")
 
-        # Submit the call to the event loop
-        asyncio.run_coroutine_threadsafe(self._run_call(call), self._loop)
+            # Track the portal running the call
+            call.set_runner(self)
 
-        self._submitted_count += 1
-        if self._run_once:
-            call.future.add_done_callback(lambda _: self.shutdown())
+            # Submit the call to the event loop
+            asyncio.run_coroutine_threadsafe(self._run_call(call), self._loop)
+
+            self._submitted_count += 1
+            if self._run_once:
+                call.future.add_done_callback(lambda _: self.shutdown())
 
         return call
 
@@ -165,10 +177,11 @@ class EventLoopThread(Portal):
         """
         Shutdown the worker thread. Does not wait for the thread to stop.
         """
-        if self._shutdown_event is None:
-            return
+        with self._lock:
+            if self._shutdown_event is None:
+                return
 
-        self._shutdown_event.set()
+            self._shutdown_event.set()
 
     @property
     def name(self) -> str:
@@ -197,10 +210,16 @@ class EventLoopThread(Portal):
 
         await self._shutdown_event.wait()
 
+        for call in self._on_shutdown:
+            await self._run_call(call)
+
     async def _run_call(self, call: Call) -> None:
         task = call.run()
         if task is not None:
             await task
+
+    def add_shutdown_call(self, call: Call) -> None:
+        self._on_shutdown.append(call)
 
     def __enter__(self):
         self.start()
@@ -231,6 +250,17 @@ def get_global_loop() -> EventLoopThread:
         GLOBAL_LOOP.start()
 
     return GLOBAL_LOOP
+
+
+def in_global_loop() -> bool:
+    """
+    Check if called from the global loop.
+    """
+    if GLOBAL_LOOP is None:
+        # Avoid creating a global loop if there isn't one
+        return False
+
+    return get_global_loop()._loop == get_running_loop()
 
 
 def wait_for_global_loop_exit() -> None:
